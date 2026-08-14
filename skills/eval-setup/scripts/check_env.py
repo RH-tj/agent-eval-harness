@@ -60,18 +60,64 @@ def main():
                     anthropic_ver or "not installed (optional)",
                     "Run /eval-setup to install"))
 
-    # 6. API keys
+    # 6. API keys + provider policy enforcement
     has_api_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    has_auth_token = bool(os.environ.get("ANTHROPIC_AUTH_TOKEN"))
     has_vertex = bool(os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"))
-    api_ok = has_api_key or has_vertex
+    has_vertex_flag = os.environ.get("CLAUDE_CODE_USE_VERTEX") == "1"
+
+    vertex_only = _get_provider_policy(args.config) == "vertex-only"
+
     api_detail = []
     if has_api_key:
         api_detail.append("ANTHROPIC_API_KEY set")
+    if has_auth_token:
+        api_detail.append("ANTHROPIC_AUTH_TOKEN set")
     if has_vertex:
         api_detail.append(f"ANTHROPIC_VERTEX_PROJECT_ID={os.environ['ANTHROPIC_VERTEX_PROJECT_ID']}")
+    if has_vertex_flag:
+        api_detail.append("CLAUDE_CODE_USE_VERTEX=1")
+
+    if vertex_only:
+        api_ok = has_vertex and has_vertex_flag
+        violations = []
+        if not has_vertex:
+            violations.append("ANTHROPIC_VERTEX_PROJECT_ID not set")
+        if not has_vertex_flag:
+            violations.append("CLAUDE_CODE_USE_VERTEX != 1")
+        if has_api_key:
+            violations.append("ANTHROPIC_API_KEY is set (data exfiltration risk: "
+                              "credentials route traffic to non-approved endpoint)")
+            api_ok = False
+        if has_auth_token:
+            violations.append("ANTHROPIC_AUTH_TOKEN is set (data exfiltration risk: "
+                              "credentials route traffic to non-approved endpoint)")
+            api_ok = False
+        has_base_url = bool(os.environ.get("ANTHROPIC_BASE_URL"))
+        if has_base_url:
+            violations.append("ANTHROPIC_BASE_URL is set (traffic redirection risk: "
+                              "overrides API endpoint)")
+            api_ok = False
+            api_detail.append(f"ANTHROPIC_BASE_URL={os.environ['ANTHROPIC_BASE_URL']}")
+        if violations:
+            api_detail.append(f"POLICY VIOLATION: {'; '.join(violations)}")
+        fix = ("provider_policy: vertex-only requires: "
+               "export ANTHROPIC_VERTEX_PROJECT_ID=<id> && "
+               "export CLAUDE_CODE_USE_VERTEX=1 && "
+               "unset ANTHROPIC_API_KEY && unset ANTHROPIC_AUTH_TOKEN && "
+               "unset ANTHROPIC_BASE_URL")
+    else:
+        api_ok = has_api_key or has_vertex
+        fix = "export ANTHROPIC_API_KEY=<key> or ANTHROPIC_VERTEX_PROJECT_ID=<id>"
+
     checks.append(("api_keys", api_ok,
                     ", ".join(api_detail) if api_detail else "none set",
-                    "export ANTHROPIC_API_KEY=<key> or ANTHROPIC_VERTEX_PROJECT_ID=<id>"))
+                    fix))
+
+    if vertex_only:
+        checks.append(("provider_policy", api_ok,
+                        "vertex-only" + (" — OK" if api_ok else " — BLOCKED"),
+                        fix))
 
     # 7. MLflow tracking URI
     tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
@@ -154,6 +200,23 @@ def main():
     else:
         print("Some required checks failed. Fix the issues above.")
         sys.exit(1)
+
+
+def _get_provider_policy(config_path):
+    """Read provider_policy from eval.yaml if available."""
+    if not config_path:
+        return "any"
+    try:
+        import yaml
+        from pathlib import Path
+        p = Path(config_path)
+        if p.exists():
+            with open(p) as f:
+                raw = yaml.safe_load(f) or {}
+            return raw.get("provider_policy", "any")
+    except Exception:
+        pass
+    return "any"
 
 
 def _check_import(module_name, pip_name=None):

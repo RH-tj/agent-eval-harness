@@ -729,6 +729,9 @@ def load_judges(config, project_root=None):
 
     Returns list of (name, scorer, condition, judge_type, samples) 5-tuples.
     """
+    if config.provider_policy == "vertex-only":
+        os.environ["AGENT_EVAL_PROVIDER_POLICY"] = "vertex-only"
+
     # Duplicate name validation
     seen_names = set()
     for jc in config.judges:
@@ -2073,7 +2076,16 @@ def _load_llm_judge(jc, config, project_root=None):
 
         return scorer
 
-    # MLflow make_judge fallback (requires OpenAI-compatible API key)
+    # MLflow make_judge fallback (requires OpenAI-compatible API key).
+    # Blocked under vertex-only policy — MLflow judges route through
+    # OpenAI-compatible endpoints which are not approved.
+    vertex_only = os.environ.get("AGENT_EVAL_PROVIDER_POLICY") == "vertex-only"
+    if vertex_only:
+        raise RuntimeError(
+            f"LLM judge '{jc.name}': provider_policy is 'vertex-only' but "
+            "ANTHROPIC_VERTEX_PROJECT_ID is not set. Cannot fall back to "
+            "MLflow/OpenAI judge — all LLM calls must route through Vertex AI."
+        )
     try:
         from mlflow.genai.judges import make_judge
         # make_judge takes no scale argument, but `_enforce_bounds` applies to
@@ -2155,7 +2167,10 @@ def compare_runs(run_a_dir, run_b_dir, config, case_ids,
     """Compare two runs using position-swapped LLM judge."""
     comparison_prompt = prompt
     if not comparison_prompt and prompt_file:
-        comparison_prompt = Path(prompt_file).read_text()
+        pf = Path(prompt_file)
+        if pf.is_absolute():
+            _resolve_under(Path.cwd(), pf)
+        comparison_prompt = pf.read_text()
     if not comparison_prompt and BUILTIN_COMPARISON_PROMPT.exists():
         comparison_prompt = BUILTIN_COMPARISON_PROMPT.read_text()
     if not comparison_prompt:
@@ -2326,8 +2341,46 @@ def _first_content(record):
 
 
 def _get_anthropic_client():
+    """Return an Anthropic client respecting provider_policy.
+
+    When AGENT_EVAL_PROVIDER_POLICY=vertex-only:
+    - ANTHROPIC_VERTEX_PROJECT_ID must be set
+    - ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must NOT be set
+    - ANTHROPIC_BASE_URL must NOT be set
+    Hard-fails on any violation to prevent data exfiltration to
+    non-approved endpoints.
+    """
+    vertex_only = os.environ.get("AGENT_EVAL_PROVIDER_POLICY") == "vertex-only"
     project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
     region = os.environ.get("CLOUD_ML_REGION", "us-east5")
+
+    if vertex_only:
+        violations = []
+        if not project_id:
+            violations.append("ANTHROPIC_VERTEX_PROJECT_ID not set")
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            violations.append(
+                "ANTHROPIC_API_KEY is set (data exfiltration risk: "
+                "credentials route traffic to non-approved endpoint)")
+        if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            violations.append(
+                "ANTHROPIC_AUTH_TOKEN is set (data exfiltration risk: "
+                "credentials route traffic to non-approved endpoint)")
+        if os.environ.get("ANTHROPIC_BASE_URL"):
+            violations.append(
+                "ANTHROPIC_BASE_URL is set (traffic redirection risk: "
+                "overrides API endpoint)")
+        if violations:
+            raise RuntimeError(
+                "provider_policy is 'vertex-only' — refusing to create "
+                f"LLM client. Violations: {'; '.join(violations)}. "
+                "Fix: unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN "
+                "ANTHROPIC_BASE_URL and export "
+                "ANTHROPIC_VERTEX_PROJECT_ID=<your-gcp-project-id>"
+            )
+        from anthropic import AnthropicVertex
+        return AnthropicVertex(project_id=project_id, region=region)
+
     if project_id:
         from anthropic import AnthropicVertex
         access_token = os.environ.get("GCP_SA_ACCESS_TOKEN")

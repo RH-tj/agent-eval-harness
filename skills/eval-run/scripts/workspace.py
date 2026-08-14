@@ -637,16 +637,31 @@ def _expand_symlink_permissions(allow_list):
     return allow_list + extras
 
 
+_VERTEX_ONLY_DENY_ENV_KEYS = {
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+}
+
+
 def _inject_env(settings, config):
     """Inject execution.env into settings.json env block.
 
     Values starting with ``$`` are resolved from ``os.environ``.
     Missing env vars are silently omitted.  Literal values pass through.
+
+    Under ``provider_policy: vertex-only``, credential keys that route
+    traffic outside Vertex AI are rejected to prevent data exfiltration.
     """
     if not config.execution.env:
         return
+    vertex_only = getattr(config, "provider_policy", "any") == "vertex-only"
     env_block = settings.setdefault("env", {})
     for key, value in config.execution.env.items():
+        if vertex_only and key in _VERTEX_ONLY_DENY_ENV_KEYS:
+            raise ValueError(
+                f"provider_policy is 'vertex-only' but execution.env "
+                f"contains '{key}' — this would route LLM traffic outside "
+                f"the approved Vertex AI boundary. Remove it from eval.yaml."
+            )
         if isinstance(value, str) and value.startswith("$"):
             resolved = os.environ.get(value[1:])
             if resolved is not None:
@@ -720,10 +735,27 @@ def _apply_runner_settings(settings, config):
     Lets users add Claude Code settings (model defaults, env, MCP servers,
     etc.) to a runner without forking the harness. Merged after harness
     defaults so user overrides win for scalar keys; lists are extended.
+
+    Under ``provider_policy: vertex-only``, rejects settings that would
+    inject direct API credentials or override the env with keys that
+    route LLM traffic outside the approved Vertex AI boundary.
     """
     user_settings = getattr(config.runner, "settings", None) or {}
-    if user_settings:
-        _deep_merge(settings, user_settings)
+    if not user_settings:
+        return
+    vertex_only = getattr(config, "provider_policy", "any") == "vertex-only"
+    if vertex_only:
+        user_env = user_settings.get("env", {})
+        if isinstance(user_env, dict):
+            for deny_key in _VERTEX_ONLY_DENY_ENV_KEYS:
+                if deny_key in user_env:
+                    raise ValueError(
+                        f"provider_policy is 'vertex-only' but "
+                        f"runner.settings.env contains '{deny_key}' — "
+                        f"this would route LLM traffic outside the "
+                        f"approved Vertex AI boundary. Remove it."
+                    )
+    _deep_merge(settings, user_settings)
 
 
 def _setup_subagent_only_hook(workspace, config):

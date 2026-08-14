@@ -893,6 +893,13 @@ class EvalConfig:
     # Regression thresholds
     thresholds: dict = field(default_factory=dict)
 
+    # Provider policy — controls which LLM backend is allowed.
+    # "any" (default): accept any configured provider.
+    # "vertex-only": require ANTHROPIC_VERTEX_PROJECT_ID and reject
+    #   ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN. Enforced by check_env.py
+    #   and score.py preflight.
+    provider_policy: str = "any"
+
     # Directory containing the eval.yaml that created this config.
     # Used as base for resolving dataset.path. None when constructed
     # programmatically (falls back to Path.cwd()).
@@ -1171,6 +1178,13 @@ class EvalConfig:
             seeds=seeds,
         )
 
+        provider_policy = raw.get("provider_policy", "any")
+        if provider_policy not in ("any", "vertex-only"):
+            raise ValueError(
+                f"provider_policy must be 'any' or 'vertex-only', "
+                f"got '{provider_policy}'"
+            )
+
         config = cls(
             name=raw.get("name", path.stem),
             description=raw.get("description", ""),
@@ -1180,6 +1194,7 @@ class EvalConfig:
             runner=runner,
             models=models,
             mlflow=mlflow,
+            provider_policy=provider_policy,
             config_dir=path.resolve().parent,
             config_path=path.resolve(),
             dataset=dataset_config,

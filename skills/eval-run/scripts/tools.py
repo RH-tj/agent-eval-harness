@@ -113,7 +113,12 @@ def _handle_ask_user(tool_input, config, handler):
     prompt = handler.get("prompt", "")
     if not prompt and handler.get("prompt_file"):
         try:
-            prompt = Path(handler["prompt_file"]).read_text()
+            pf = Path(handler["prompt_file"])
+            if pf.is_absolute() and not pf.resolve().is_relative_to(Path.cwd().resolve()):
+                print(f"BLOCKED: prompt_file escapes project root: {pf}",
+                      file=sys.stderr)
+            else:
+                prompt = pf.read_text()
         except OSError:
             pass
     answers = {}
@@ -185,8 +190,7 @@ Based on the handler instructions and case context, which option should be selec
 Reply with ONLY the option label text, nothing else."""
 
     try:
-        import anthropic
-        client = anthropic.Anthropic(timeout=30.0)
+        client = _get_anthropic_client()
         response = client.messages.create(
             model=model or "claude-haiku-4-5-20251001",
             max_tokens=256,
@@ -210,6 +214,46 @@ Reply with ONLY the option label text, nothing else."""
         print(f"LLM answer failed: {e}", file=sys.stderr)
 
     return None
+
+
+def _get_anthropic_client():
+    """Return an Anthropic client respecting provider_policy.
+
+    When AGENT_EVAL_PROVIDER_POLICY=vertex-only:
+    - ANTHROPIC_VERTEX_PROJECT_ID must be set
+    - ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN must NOT be set
+    - ANTHROPIC_BASE_URL must NOT be set
+    Hard-fails on any violation to prevent data exfiltration to
+    non-approved endpoints.
+    """
+    import anthropic
+    vertex_only = os.environ.get("AGENT_EVAL_PROVIDER_POLICY") == "vertex-only"
+    project_id = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID")
+
+    if vertex_only:
+        violations = []
+        if not project_id:
+            violations.append("ANTHROPIC_VERTEX_PROJECT_ID not set")
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            violations.append("ANTHROPIC_API_KEY is set (data exfiltration risk)")
+        if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            violations.append("ANTHROPIC_AUTH_TOKEN is set (data exfiltration risk)")
+        if os.environ.get("ANTHROPIC_BASE_URL"):
+            violations.append("ANTHROPIC_BASE_URL is set (traffic redirection risk)")
+        if violations:
+            raise RuntimeError(
+                "provider_policy is 'vertex-only' — refusing to create "
+                f"LLM client. Violations: {'; '.join(violations)}")
+        region = os.environ.get("CLOUD_ML_REGION", "us-east5")
+        return anthropic.AnthropicVertex(
+            project_id=project_id, region=region, timeout=30.0)
+
+    if project_id:
+        region = os.environ.get("CLOUD_ML_REGION", "us-east5")
+        return anthropic.AnthropicVertex(
+            project_id=project_id, region=region, timeout=30.0)
+
+    return anthropic.Anthropic(timeout=30.0)
 
 
 def _deny(reason):

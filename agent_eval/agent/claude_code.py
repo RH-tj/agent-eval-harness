@@ -457,11 +457,25 @@ class ClaudeCodeRunner(EvalRunner):
         "CLOUDSDK_CONFIG", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
         "MLFLOW_TRACKING_URI", "MLFLOW_EXPERIMENT_NAME",
         "AGENT_EVAL_RUNS_DIR",
+        "AGENT_EVAL_PROVIDER_POLICY",
+    }
+
+    # Keys stripped from subprocess env under vertex-only policy to prevent
+    # credentials for non-approved endpoints from leaking into skill processes.
+    _VERTEX_ONLY_DENY_KEYS = {
+        "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
     }
 
     def _build_env(self, extra_env=None):
-        """Build subprocess environment with allowlisted keys only."""
+        """Build subprocess environment with allowlisted keys only.
+
+        When AGENT_EVAL_PROVIDER_POLICY=vertex-only, strips direct Anthropic
+        API credentials to prevent data exfiltration to non-approved endpoints.
+        """
         env = {k: v for k, v in os.environ.items() if k in self._SAFE_ENV_KEYS}
+        if env.get("AGENT_EVAL_PROVIDER_POLICY") == "vertex-only":
+            for deny_key in self._VERTEX_ONLY_DENY_KEYS:
+                env.pop(deny_key, None)
         for k, v in self._env.items():
             if v is None:
                 continue

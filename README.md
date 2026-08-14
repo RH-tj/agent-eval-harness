@@ -158,6 +158,9 @@ execution:
   #   JIRA_SERVER: http://localhost:8080   # Literal value
   #   JIRA_TOKEN: $JIRA_TOKEN              # $VAR resolved from caller's env
 
+# Provider policy — restrict which LLM backend is used
+# provider_policy: vertex-only  # require Vertex AI, reject direct API keys
+
 # Runner — agent harness + runner-specific knobs
 runner:
   type: claude-code          # claude-code | codex | cli | responses-api
@@ -356,6 +359,7 @@ thresholds:
 - **`runner`** — `type` selects `claude-code`, `codex`, `cli`, or `responses-api`; remaining fields are runner-specific. Codex accepts `minimal`, `low`, `medium`, `high`, and `xhigh`; its CLI does not enforce `max_budget_usd`. Local Codex defaults to `workspace-write`; `permission_mode: plan` maps to `read-only`, while `bypassPermissions` maps to Codex's unrestricted bypass and should be used only inside a container or VM.
 - **`models`** — `skill`/`subagent`/`judge`/`hook` defaults, overridable per-judge or via CLI flags. `hook` is the model used for LLM-based AskUserQuestion answering.
 - **`mlflow`** — `experiment` (and optional `tracking_uri`/`tags`) for result logging.
+- **`provider_policy`** — `"any"` (default) or `"vertex-only"`. When `vertex-only`, the preflight check and judge client factory enforce that all LLM calls route through Google Vertex AI and reject direct Anthropic API keys.
 - **`thresholds`** — per-judge regression detection. Valid keys: `min_mean` (minimum average score), `min_pass_rate` (minimum fraction of cases passing, 0.0–1.0), `min_win_rate` (minimum pairwise win rate), `max_error_rate` (**maximum** fraction of cases the judge may error on, 0.0–1.0 — an opt-in coverage gate; the other three are computed over the cases that produced a value).
 
 ## Example: eval.yaml for RFE Creator
@@ -789,8 +793,74 @@ pip install -e "./agent-eval-harness[mlflow]"
 echo "/rfe.speedrun --input batch.yaml --headless" | claude-trace --model opus
 ```
 
+## Vertex AI Provider Policy
+
+The harness supports enforcing Vertex AI as the exclusive LLM provider via the `provider_policy` field in `eval.yaml`. This is required for environments where direct Anthropic API access is not permitted (e.g., Red Hat enterprise AI compliance).
+
+### Configuration
+
+Add `provider_policy: vertex-only` to your eval.yaml:
+
+```yaml
+name: my-skill-eval
+skill: my-skill
+
+provider_policy: vertex-only  # enforce Vertex AI for all LLM calls
+
+execution:
+  env:
+    CLAUDE_CODE_USE_VERTEX: "1"
+    ANTHROPIC_VERTEX_PROJECT_ID: $ANTHROPIC_VERTEX_PROJECT_ID
+    CLOUD_ML_REGION: $CLOUD_ML_REGION
+
+runner:
+  type: claude-code
+  env:
+    CLAUDE_CODE_USE_VERTEX: "1"
+    ANTHROPIC_VERTEX_PROJECT_ID: $ANTHROPIC_VERTEX_PROJECT_ID
+    CLOUD_ML_REGION: $CLOUD_ML_REGION
+```
+
+### Required environment variables
+
+```bash
+export ANTHROPIC_VERTEX_PROJECT_ID=your-gcp-project-id  # GCP project with Claude models
+export CLOUD_ML_REGION=us-east5                          # Vertex AI region
+export CLAUDE_CODE_USE_VERTEX=1                          # force Claude Code to use Vertex
+```
+
+### What it enforces
+
+All checks are **hard failures** — the eval run is blocked until violations are resolved.
+
+| Check | Mechanism | Failure mode |
+|---|---|---|
+| `ANTHROPIC_VERTEX_PROJECT_ID` must be set | `check_env.py` preflight + `_get_anthropic_client()` | Blocks run at preflight AND at runtime |
+| `CLAUDE_CODE_USE_VERTEX` must be `1` | `check_env.py` preflight | Blocks run at preflight |
+| `ANTHROPIC_API_KEY` must NOT be set | `check_env.py` + `_get_anthropic_client()` + `_build_env()` | Blocks run; stripped from subprocess env |
+| `ANTHROPIC_AUTH_TOKEN` must NOT be set | `check_env.py` + `_get_anthropic_client()` + `_build_env()` | Blocks run; stripped from subprocess env |
+| `ANTHROPIC_BASE_URL` must NOT be set | `check_env.py` + `_get_anthropic_client()` + `_build_env()` | Blocks run; stripped from subprocess env |
+| LLM judges use `AnthropicVertex` only | `_get_anthropic_client()` rejects fallback to direct/OpenAI | Hard error, no fallback |
+| MLflow/OpenAI judge fallback blocked | `score.py` `_build_llm_judge()` | Hard error before `make_judge()` |
+| Skill subprocess gets no direct API creds | `claude_code.py` `_build_env()` `_VERTEX_ONLY_DENY_KEYS` | Keys stripped from forwarded env |
+
+When `provider_policy` is `"any"` (the default), all providers are accepted and the existing behavior is unchanged.
+
+### How it works
+
+Four enforcement layers prevent non-Vertex LLM calls:
+
+1. **Preflight** (`/eval-setup` → `check_env.py`): Reads `provider_policy` from the `--config` eval.yaml. Validates that `ANTHROPIC_VERTEX_PROJECT_ID` is set, `CLAUDE_CODE_USE_VERTEX=1`, and that `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` are NOT set. **Hard failure** — exits with code 1 and prints `POLICY VIOLATION` with fix instructions.
+
+2. **Runner env stripping** (`claude_code.py` → `_build_env()`): When `AGENT_EVAL_PROVIDER_POLICY=vertex-only`, the subprocess environment builder strips `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, and `ANTHROPIC_BASE_URL` from the forwarded environment — even if they somehow exist in the parent process. Prevents credential leakage into skill subprocesses.
+
+3. **Client factory** (`score.py` + `tools.py` → `_get_anthropic_client()`): Under `vertex-only`, the factory rejects the request if any direct API credentials are present (not just if Vertex is missing). This catches misconfiguration where both Vertex and direct keys are set simultaneously.
+
+4. **Judge fallback blocking** (`score.py` → `_build_llm_judge()`): The MLflow `make_judge()` fallback (which routes through OpenAI-compatible APIs) is blocked under `vertex-only` with a hard error — no silent fallback to non-approved providers.
+
 ## Dependencies
 
 - `pyyaml >= 6.0`
 - Optional: `mlflow[genai] >= 3.5` (for `/eval-mlflow` and `claude-trace`)
 - Optional: `anthropic >= 0.40` (for LLM judges, pairwise comparison, synthetic dataset generation, and hook answering)
+- Optional: `anthropic[vertex]` (required when `provider_policy: vertex-only`)

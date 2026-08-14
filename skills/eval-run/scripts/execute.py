@@ -214,6 +214,9 @@ def main():
     from agent_eval.config import EvalConfig
     config = EvalConfig.from_yaml(args.config)
 
+    if config.provider_policy == "vertex-only":
+        os.environ["AGENT_EVAL_PROVIDER_POLICY"] = "vertex-only"
+
     # Determine if prompt mode (execution.prompt is set)
     is_prompt_mode = config.is_prompt_mode()
     # Multi-step: execution.steps drives per-step targets; no single skill.
